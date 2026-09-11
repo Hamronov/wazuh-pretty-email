@@ -1,0 +1,12 @@
+config/custom_pretty_email.json
+config/custom_pretty_email_exclusions.json
+*.log
+__pycache__/
+*.pyc
+*private*
+*dedup.json
+*health.json
+preview/
+.DS_Store
+.env
+.env.*

@@ -1,0 +1,13 @@
+{
+  "smtp_host": "smtp.example.org",
+  "smtp_port": 25,
+  "from": "wazuh@example.org",
+  "from_name": "Wazuh Security",
+  "to": [
+    "soc@example.org"
+  ],
+  "subject_prefix": "[Wazuh]",
+  "dashboard_url": "https://wazuh.example.org",
+  "include_raw_json": false,
+  "smtp_timeout": 20
+}

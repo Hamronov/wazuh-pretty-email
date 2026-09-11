@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Example: approved maintenance event",
+    "keywords": [
+      "approved-maintenance-example"
+    ],
+    "field_equals": {
+      "rule.id": "100001"
+    },
+    "field_regex": {
+      "agent.name": "test-host-[0-9]+"
+    }
+  }
+]

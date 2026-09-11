@@ -1,0 +1,10 @@
+{
+  "export_date": "2026-09-11",
+  "script_source": "/var/ossec/integrations/custom-pretty-email",
+  "script_sha256": "cd1b5976bc4e6e5b1e2df21a304f66ba8516fc0b0df18dd38815b870c1cd642b",
+  "script_modified": false,
+  "integration_level": 12,
+  "production_exclusion_count": 53,
+  "public_exclusions": "empty by design; production list in private archive",
+  "verification": "Python syntax and synthetic HTML/text rendering passed; no email sent"
+}

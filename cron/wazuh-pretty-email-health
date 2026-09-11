@@ -1,0 +1,3 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+* * * * * wazuh /var/ossec/integrations/custom-pretty-email --flush-health >> /var/ossec/logs/pretty-email-health.log 2>&1

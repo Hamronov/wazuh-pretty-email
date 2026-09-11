@@ -1,0 +1,20 @@
+[Wazuh][HIGH][12] test-host-01 - Демонстрационный инцидент — 192.0.2.20 → 192.0.2.10
+
+[Wazuh][HIGH][12] test-host-01 - Демонстрационный инцидент — 192.0.2.20 → 192.0.2.10
+
+Что произошло:
+На хосте test-host-01 сработало правило 100001 — Демонстрационный инцидент. Сетевой контекст: 192.0.2.20 → 192.0.2.10.
+
+Ключевые данные:
+Правило: 100001 - Демонстрационный инцидент
+Критичность: HIGH (level 12)
+Хост: test-host-01
+Время: 2026-09-11T12:00:00+00:00
+Agent ID: 001
+IP агента: 192.0.2.10
+Source IP: 192.0.2.20
+Destination IP: 192.0.2.10
+Группы: example
+Alert ID: example-alert-001
+
+Ссылка на событие: https://wazuh.example.org/app/data-explorer/discover#?_a=(discover:(columns:!(_source),isDirty:!f,sort:!()),metadata:(indexPattern:'wazuh-alerts-*',view:discover))&_g=(filters:!(),refreshInterval:(pause:!t,value:0),time:(from:'2026-09-11T11:30:00.000Z',to:'2026-09-11T12:30:00.000Z'))&_q=(filters:!(),query:(language:kuery,query:'id:"example-alert-001"'))

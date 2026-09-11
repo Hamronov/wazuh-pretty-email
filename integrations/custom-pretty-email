@@ -1,0 +1,1054 @@
+#!/var/ossec/framework/python/bin/python3
+# -*- coding: utf-8 -*-
+
+import fcntl
+import hashlib
+import json
+import re
+import smtplib
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from email.header import Header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from html import escape
+from urllib.parse import quote
+
+CONFIG_PATH = "/var/ossec/etc/custom_pretty_email.json"
+EXCLUSIONS_PATH = "/var/ossec/etc/custom_pretty_email_exclusions.json"
+DEDUP_STATE_PATH = "/var/ossec/var/run/custom_pretty_email_dedup.json"
+DEDUP_TTLS = {
+    "121107": 24 * 60 * 60,
+}
+
+
+def load_json(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    for enc in ("utf-8", "cp1251"):
+        try:
+            return json.loads(raw.decode(enc))
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def load_json_safe(path, default=None):
+    """Загрузка JSON с fallback на default при ошибке."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        for enc in ("utf-8", "cp1251"):
+            try:
+                return json.loads(raw.decode(enc))
+            except (UnicodeDecodeError, ValueError):
+                continue
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except FileNotFoundError:
+        return default if default is not None else []
+    except Exception as e:
+        sys.stderr.write(f"custom-pretty-email: failed to load {path}: {e}\n")
+        return default if default is not None else []
+
+
+# ──────────────────────────────────────────────
+#  DEDUPLICATION LOGIC
+# ──────────────────────────────────────────────
+
+def get_dedup_key(alert):
+    """Возвращает ключ инцидента для правил, где допустимо одно письмо."""
+    rule_id = str(alert.get("rule", {}).get("id", ""))
+    if rule_id not in DEDUP_TTLS:
+        return None, None
+
+    full_log = alert.get("full_log", "")
+    try:
+        correlation = json.loads(full_log) if isinstance(full_log, str) else full_log
+    except (TypeError, ValueError):
+        return None, None
+
+    if not isinstance(correlation, dict):
+        return None, None
+
+    target = str(correlation.get("targetUserName", "")).strip().lower()
+    actor = str(correlation.get("resetActor", "")).strip().lower()
+    reset_timestamp = str(correlation.get("resetTimestamp", "")).strip()
+    if not target or not reset_timestamp:
+        return None, None
+
+    raw_key = "|".join((rule_id, target, actor, reset_timestamp))
+    key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    return key, DEDUP_TTLS[rule_id]
+
+
+def reserve_dedup(alert, state_path=DEDUP_STATE_PATH):
+    """Атомарно резервирует отправку; возвращает (key, duplicate)."""
+    key, ttl = get_dedup_key(alert)
+    if not key:
+        return None, False
+
+    now = time.time()
+    try:
+        with open(state_path, "a+", encoding="utf-8") as state_file:
+            fcntl.flock(state_file.fileno(), fcntl.LOCK_EX)
+            state_file.seek(0)
+            try:
+                state = json.load(state_file)
+            except (ValueError, TypeError):
+                state = {}
+            if not isinstance(state, dict):
+                state = {}
+
+            state = {
+                saved_key: saved_at
+                for saved_key, saved_at in state.items()
+                if isinstance(saved_at, (int, float)) and now - saved_at < 2 * 24 * 60 * 60
+            }
+            duplicate = key in state and now - state[key] < ttl
+            if not duplicate:
+                state[key] = now
+
+            state_file.seek(0)
+            state_file.truncate()
+            json.dump(state, state_file, ensure_ascii=False)
+            state_file.flush()
+            fcntl.flock(state_file.fileno(), fcntl.LOCK_UN)
+    except Exception as error:
+        sys.stderr.write(f"custom-pretty-email: dedup unavailable, sending alert: {error}\n")
+        return None, False
+
+    return key, duplicate
+
+
+def release_dedup(key, state_path=DEDUP_STATE_PATH):
+    """Освобождает резерв, если SMTP-отправка завершилась ошибкой."""
+    if not key:
+        return
+
+    try:
+        with open(state_path, "a+", encoding="utf-8") as state_file:
+            fcntl.flock(state_file.fileno(), fcntl.LOCK_EX)
+            state_file.seek(0)
+            try:
+                state = json.load(state_file)
+            except (ValueError, TypeError):
+                state = {}
+            if isinstance(state, dict):
+                state.pop(key, None)
+            else:
+                state = {}
+            state_file.seek(0)
+            state_file.truncate()
+            json.dump(state, state_file, ensure_ascii=False)
+            state_file.flush()
+            fcntl.flock(state_file.fileno(), fcntl.LOCK_UN)
+    except Exception as error:
+        sys.stderr.write(f"custom-pretty-email: failed to release dedup key: {error}\n")
+
+
+# ──────────────────────────────────────────────
+#  EXCLUSION LOGIC
+# ──────────────────────────────────────────────
+
+def flatten_alert_to_text(alert, _depth=0):
+    """
+    Рекурсивно собирает ВСЕ строковые значения из алерта
+    в одну большую строку для поиска ключевых слов.
+    """
+    if _depth > 20:
+        return ""
+
+    parts = []
+
+    if isinstance(alert, dict):
+        for key, value in alert.items():
+            parts.append(str(key))
+            parts.append(flatten_alert_to_text(value, _depth + 1))
+    elif isinstance(alert, list):
+        for item in alert:
+            parts.append(flatten_alert_to_text(item, _depth + 1))
+    else:
+        parts.append(str(alert))
+
+    return " ".join(parts)
+
+
+def get_nested_value(data, dotted_path):
+    """Получает значение из вложенного словаря по пути вида data.win.eventdata.image."""
+    value = data
+    for part in str(dotted_path).split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def check_exclusions(alert, exclusions_path=EXCLUSIONS_PATH):
+    """
+    Проверяет алерт по списку исключений.
+    
+    Каждое исключение содержит список keywords.
+    Если ВСЕ keywords из одного исключения найдены в алерте
+    (регистронезависимо) — возвращает имя сработавшего исключения.
+    
+    Возвращает:
+      - None — исключений не сработало, отправляем
+      - str  — имя сработавшего исключения, НЕ отправляем
+    """
+    exclusions = load_json_safe(exclusions_path, default=[])
+
+    if not exclusions:
+        return None
+
+    # Собираем весь текст алерта в одну строку (lowercase)
+    alert_text = flatten_alert_to_text(alert).lower()
+
+    for idx, rule in enumerate(exclusions):
+        if not isinstance(rule, dict):
+            continue
+
+        keywords = rule.get("keywords", [])
+        if not keywords or not isinstance(keywords, list):
+            continue
+
+        rule_name = rule.get("name", f"exclusion_{idx}")
+
+        # Проверяем: ВСЕ ключевые слова должны присутствовать
+        all_found = True
+        for kw in keywords:
+            kw_lower = str(kw).strip().lower()
+            if not kw_lower:
+                continue
+            if kw_lower not in alert_text:
+                all_found = False
+                break
+
+        field_equals = rule.get("field_equals", {})
+        if all_found and isinstance(field_equals, dict):
+            for field_path, expected in field_equals.items():
+                actual = get_nested_value(alert, field_path)
+                if str(actual).casefold() != str(expected).casefold():
+                    all_found = False
+                    break
+
+        if all_found:
+            for field_path, pattern in rule.get("field_regex", {}).items():
+                actual = get_nested_value(alert, field_path)
+                # Sysmon JSON may contain doubled Windows separators.
+                normalized = re.sub(r"\\+", lambda m: "\\", str(actual)) if actual is not None else ""
+                if not re.fullmatch(pattern, normalized, re.IGNORECASE):
+                    all_found = False
+                    break
+
+        if all_found:
+            return rule_name
+
+    return None
+
+
+# ──────────────────────────────────────────────
+#  UTILITY FUNCTIONS (без изменений)
+# ──────────────────────────────────────────────
+
+def pick(*values, default=""):
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            if v.strip():
+                return v.strip()
+        elif v != "":
+            return v
+    return default
+
+
+def as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return [str(v)]
+
+
+def severity(level):
+    try:
+        level = int(level)
+    except Exception:
+        level = 0
+
+    if level >= 15:
+        return "CRITICAL", "#b91c1c"
+    if level >= 12:
+        return "HIGH", "#ea580c"
+    if level >= 8:
+        return "MEDIUM", "#d97706"
+    if level >= 5:
+        return "LOW", "#2563eb"
+    return "INFO", "#475569"
+
+
+def shorten(text, limit=140):
+    text = str(text)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def path_basename(path):
+    path = str(path).replace("\\", "/").rstrip("/")
+    return path.split("/")[-1] if path else ""
+
+
+def build_mitre_text(mitre):
+    if not isinstance(mitre, dict) or not mitre:
+        return ""
+
+    parts = []
+
+    ids = as_list(mitre.get("id"))
+    tactics = as_list(mitre.get("tactic"))
+    techniques = as_list(mitre.get("technique"))
+
+    if ids:
+        parts.append("ID: " + ", ".join(ids))
+    if tactics:
+        parts.append("Tactic: " + ", ".join(tactics))
+    if techniques:
+        parts.append("Technique: " + ", ".join(techniques))
+
+    return " | ".join(parts)
+
+
+def normalize_iso_datetime(value):
+    s = str(value).strip()
+    if not s:
+        return ""
+
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    if len(s) >= 5 and (s[-5] in ["+", "-"]) and s[-2] != ":" and s[-4:].isdigit():
+        s = s[:-2] + ":" + s[-2:]
+
+    if "." in s:
+        head, tail = s.split(".", 1)
+        tz_pos = max(tail.rfind("+"), tail.rfind("-"))
+        if tz_pos != -1:
+            frac = tail[:tz_pos]
+            tz = tail[tz_pos:]
+        else:
+            frac = tail
+            tz = ""
+
+        frac_digits = "".join(ch for ch in frac if ch.isdigit())
+        if frac_digits:
+            frac_digits = frac_digits[:6]
+            s = f"{head}.{frac_digits}{tz}"
+        else:
+            s = f"{head}{tz}"
+
+    return s
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+
+    raw = str(value).strip()
+    norm = normalize_iso_datetime(raw)
+
+    candidates = [norm, raw]
+
+    for item in candidates:
+        try:
+            dt = datetime.fromisoformat(item)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    formats = [
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S"
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+
+    return None
+
+
+def format_utc(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def rison_escape(value):
+    s = str(value)
+    s = s.replace("!", "!!")
+    s = s.replace("'", "!'")
+    return s
+
+
+def build_event_query(meta):
+    alert_id = meta.get("alert_id", "")
+    rule_id = meta.get("rule_id", "")
+    host = meta.get("host", "")
+    agent_id = meta.get("agent_id", "")
+    event_id = meta.get("event_id", "")
+
+    if alert_id and alert_id != "-":
+        return f'id:"{alert_id}"'
+
+    parts = []
+    if rule_id and rule_id != "-":
+        parts.append(f'rule.id:{rule_id}')
+    if agent_id and agent_id != "-":
+        parts.append(f'agent.id:"{agent_id}"')
+    elif host:
+        parts.append(f'agent.name:"{host}"')
+    if event_id:
+        parts.append(f'data.win.system.eventID:"{event_id}"')
+
+    return " and ".join(parts)
+
+
+def build_event_url(meta, cfg):
+    base = str(cfg.get("dashboard_url", "") or "").strip().rstrip("/")
+    if not base:
+        return ""
+
+    query_text = build_event_query(meta)
+    if not query_text:
+        return base
+
+    dt = parse_timestamp(meta.get("timestamp"))
+    if dt:
+        time_from = format_utc(dt - timedelta(minutes=30))
+        time_to = format_utc(dt + timedelta(minutes=30))
+    else:
+        time_from = "now-24h"
+        time_to = "now"
+
+    a_part = "(discover:(columns:!(_source),isDirty:!f,sort:!()),metadata:(indexPattern:'wazuh-alerts-*',view:discover))"
+    g_part = f"(filters:!(),refreshInterval:(pause:!t,value:0),time:(from:'{time_from}',to:'{time_to}'))"
+    q_part = f"(filters:!(),query:(language:kuery,query:'{rison_escape(query_text)}'))"
+
+    safe_chars = "()!,:*'\"-_./"
+
+    return (
+        f"{base}/app/data-explorer/discover"
+        f"#?_a={quote(a_part, safe=safe_chars)}"
+        f"&_g={quote(g_part, safe=safe_chars)}"
+        f"&_q={quote(q_part, safe=safe_chars)}"
+    )
+
+
+def build_title(meta):
+    rule_desc = meta.get("rule_desc", "Wazuh alert")
+    target_file = meta.get("target_file", "")
+    process = meta.get("process", "")
+    src_ip = meta.get("src_ip", "")
+    dst_ip = meta.get("dst_ip", "")
+
+    if target_file:
+        return f"{rule_desc} — {path_basename(target_file)}"
+    if process:
+        return f"{rule_desc} — {path_basename(process)}"
+    if src_ip and dst_ip:
+        return f"{rule_desc} — {src_ip} → {dst_ip}"
+    return rule_desc
+
+
+def build_story(meta):
+    parts = [
+        f"На хосте {meta.get('host', 'unknown-host')} сработало правило {meta.get('rule_id', '-')} — {meta.get('rule_desc', 'Wazuh alert')}."
+    ]
+
+    if meta.get("provider"):
+        parts.append(f"Источник события: {meta['provider']}.")
+    if meta.get("user"):
+        parts.append(f"Пользователь: {meta['user']}.")
+    if meta.get("process"):
+        parts.append(f"Процесс: {meta['process']}.")
+    if meta.get("parent_process"):
+        parts.append(f"Родительский процесс: {meta['parent_process']}.")
+    if meta.get("target_file"):
+        parts.append(f"Объект/файл: {meta['target_file']}.")
+    if meta.get("command_line"):
+        parts.append(f"Командная строка: {shorten(meta['command_line'], 300)}.")
+
+    if meta.get("src_ip") or meta.get("dst_ip"):
+        network = []
+        if meta.get("src_ip"):
+            src = meta["src_ip"]
+            if meta.get("src_port"):
+                src += f":{meta['src_port']}"
+            network.append(src)
+        if meta.get("dst_ip"):
+            dst = meta["dst_ip"]
+            if meta.get("dst_port"):
+                dst += f":{meta['dst_port']}"
+            if network:
+                network.append("→")
+            network.append(dst)
+        if meta.get("protocol"):
+            network.append(f"({meta['protocol']})")
+        parts.append("Сетевой контекст: " + " ".join(network) + ".")
+
+    if meta.get("action"):
+        parts.append(f"Действие: {meta['action']}.")
+    if meta.get("status"):
+        parts.append(f"Статус: {meta['status']}.")
+    if meta.get("domain"):
+        parts.append(f"Домен/хост: {meta['domain']}.")
+    if meta.get("url"):
+        parts.append(f"URL: {meta['url']}.")
+    if meta.get("hashes"):
+        parts.append(f"Хэши: {shorten(meta['hashes'], 300)}.")
+
+    return " ".join(parts)
+
+
+def get_alert_meta(alert):
+    rule = alert.get("rule", {})
+    agent = alert.get("agent", {})
+    data = alert.get("data", {}) if isinstance(alert.get("data"), dict) else {}
+
+    win = data.get("win", {}) if isinstance(data.get("win"), dict) else {}
+    if not win and isinstance(alert.get("win"), dict):
+        win = alert.get("win", {})
+
+    system = win.get("system", {}) if isinstance(win.get("system"), dict) else {}
+    eventdata = win.get("eventdata", {}) if isinstance(win.get("eventdata"), dict) else {}
+
+    level = pick(rule.get("level"), default="0")
+    sev_name, sev_color = severity(level)
+
+    fqdn = pick(system.get("computer"))
+    host = pick(
+        agent.get("name"),
+        fqdn,
+        alert.get("hostname"),
+        default="unknown-host"
+    )
+
+    timestamp = pick(
+        alert.get("timestamp"),
+        system.get("systemTime"),
+        default="-"
+    )
+
+    rule_id = pick(rule.get("id"), default="-")
+    rule_desc = pick(rule.get("description"), default="Wazuh alert")
+    alert_id = pick(alert.get("id"), default="-")
+    firedtimes = pick(rule.get("firedtimes"))
+    agent_id = pick(agent.get("id"), default="-")
+
+    provider = pick(system.get("providerName"))
+    event_id = pick(system.get("eventID"), data.get("event_id"))
+    channel = pick(system.get("channel"))
+    location = pick(alert.get("location"))
+
+    user = pick(
+        eventdata.get("user"),
+        data.get("srcuser"),
+        data.get("dstuser"),
+        alert.get("user")
+    )
+
+    process = pick(
+        eventdata.get("image"),
+        eventdata.get("process"),
+        data.get("image"),
+        data.get("process")
+    )
+
+    parent_process = pick(
+        eventdata.get("parentImage"),
+        data.get("parentImage")
+    )
+
+    target_file = pick(
+        eventdata.get("targetFilename"),
+        data.get("file"),
+        data.get("filename"),
+        data.get("path")
+    )
+
+    command_line = pick(
+        eventdata.get("commandLine"),
+        data.get("command"),
+        data.get("cmd"),
+        data.get("commandLine")
+    )
+
+    process_id = pick(
+        eventdata.get("processId"),
+        system.get("processID"),
+        data.get("processId")
+    )
+
+    agent_ip = pick(agent.get("ip"))
+    src_ip = pick(
+        data.get("srcip"),
+        alert.get("srcip"),
+        eventdata.get("sourceIp"),
+        eventdata.get("sourceIPAddress")
+    )
+    src_port = pick(
+        data.get("srcport"),
+        alert.get("srcport"),
+        eventdata.get("sourcePort")
+    )
+    dst_ip = pick(
+        data.get("dstip"),
+        alert.get("dstip"),
+        eventdata.get("destinationIp"),
+        eventdata.get("destinationIPAddress")
+    )
+    dst_port = pick(
+        data.get("dstport"),
+        alert.get("dstport"),
+        eventdata.get("destinationPort")
+    )
+    protocol = pick(
+        data.get("protocol"),
+        eventdata.get("protocol")
+    )
+    action = pick(
+        data.get("action"),
+        eventdata.get("action")
+    )
+    status = pick(
+        data.get("status"),
+        eventdata.get("status")
+    )
+    domain = pick(
+        data.get("domain"),
+        data.get("hostname"),
+        eventdata.get("destinationHostname"),
+        eventdata.get("queryName")
+    )
+    url = pick(
+        data.get("url"),
+        eventdata.get("url")
+    )
+    hashes = pick(
+        eventdata.get("hashes"),
+        data.get("hashes")
+    )
+
+    groups = ", ".join(as_list(rule.get("groups")))
+    mitre = build_mitre_text(rule.get("mitre"))
+
+    meta = {
+        "level": str(level),
+        "sev_name": sev_name,
+        "sev_color": sev_color,
+        "host": str(host),
+        "fqdn": str(fqdn),
+        "timestamp": str(timestamp),
+        "rule_id": str(rule_id),
+        "rule_desc": str(rule_desc),
+        "alert_id": str(alert_id),
+        "firedtimes": str(firedtimes) if firedtimes else "",
+        "agent_id": str(agent_id),
+        "provider": str(provider),
+        "event_id": str(event_id),
+        "channel": str(channel),
+        "location": str(location),
+        "user": str(user),
+        "process": str(process),
+        "parent_process": str(parent_process),
+        "target_file": str(target_file),
+        "command_line": str(command_line),
+        "process_id": str(process_id),
+        "agent_ip": str(agent_ip),
+        "src_ip": str(src_ip),
+        "src_port": str(src_port),
+        "dst_ip": str(dst_ip),
+        "dst_port": str(dst_port),
+        "protocol": str(protocol),
+        "action": str(action),
+        "status": str(status),
+        "domain": str(domain),
+        "url": str(url),
+        "hashes": str(hashes),
+        "groups": str(groups),
+        "mitre": str(mitre),
+        "full_log": alert.get("full_log", "")
+    }
+
+    meta["title"] = build_title(meta)
+    meta["story"] = build_story(meta)
+    meta["event_url"] = build_event_url(meta, load_json(CONFIG_PATH))
+
+    fields = [
+        ("Правило", f"{meta['rule_id']} - {meta['rule_desc']}"),
+        ("Критичность", f"{meta['sev_name']} (level {meta['level']})"),
+        ("Хост", meta["host"]),
+        ("Время", meta["timestamp"]),
+    ]
+
+    if meta["fqdn"] and meta["fqdn"] != meta["host"]:
+        fields.append(("FQDN", meta["fqdn"]))
+    if meta["agent_id"] and meta["agent_id"] != "-":
+        fields.append(("Agent ID", meta["agent_id"]))
+    if meta["agent_ip"]:
+        fields.append(("IP агента", meta["agent_ip"]))
+    if meta["provider"]:
+        fields.append(("Provider", meta["provider"]))
+    if meta["event_id"]:
+        fields.append(("Event ID", meta["event_id"]))
+    if meta["channel"]:
+        fields.append(("Канал", meta["channel"]))
+    if meta["location"]:
+        fields.append(("Источник", meta["location"]))
+    if meta["user"]:
+        fields.append(("Пользователь", meta["user"]))
+    if meta["process"]:
+        fields.append(("Процесс", meta["process"]))
+    if meta["parent_process"]:
+        fields.append(("Родительский процесс", meta["parent_process"]))
+    if meta["process_id"]:
+        fields.append(("PID", meta["process_id"]))
+    if meta["target_file"]:
+        fields.append(("Файл/объект", meta["target_file"]))
+    if meta["command_line"]:
+        fields.append(("Командная строка", meta["command_line"]))
+    if meta["src_ip"]:
+        fields.append(("Source IP", meta["src_ip"]))
+    if meta["src_port"]:
+        fields.append(("Source Port", meta["src_port"]))
+    if meta["dst_ip"]:
+        fields.append(("Destination IP", meta["dst_ip"]))
+    if meta["dst_port"]:
+        fields.append(("Destination Port", meta["dst_port"]))
+    if meta["protocol"]:
+        fields.append(("Protocol", meta["protocol"]))
+    if meta["action"]:
+        fields.append(("Action", meta["action"]))
+    if meta["status"]:
+        fields.append(("Status", meta["status"]))
+    if meta["domain"]:
+        fields.append(("Domain/Host", meta["domain"]))
+    if meta["url"]:
+        fields.append(("URL", meta["url"]))
+    if meta["hashes"]:
+        fields.append(("Hashes", meta["hashes"]))
+    if meta["mitre"]:
+        fields.append(("MITRE", meta["mitre"]))
+    if meta["groups"]:
+        fields.append(("Группы", meta["groups"]))
+    if meta["firedtimes"]:
+        fields.append(("Количество срабатываний", meta["firedtimes"]))
+    if meta["alert_id"] and meta["alert_id"] != "-":
+        fields.append(("Alert ID", meta["alert_id"]))
+
+    meta["fields"] = fields
+    return meta
+
+
+def build_messages(meta, cfg):
+    prefix = cfg.get("subject_prefix", "[Wazuh]")
+    include_raw = bool(cfg.get("include_raw_json", False))
+    event_url = meta.get("event_url", "") or str(cfg.get("dashboard_url", "") or "").strip()
+
+    subject = f"{prefix}[{meta['sev_name']}][{meta['level']}] {meta['host']} - {shorten(meta['title'], 110)}"
+
+    text_lines = [subject, ""]
+    text_lines.append("Что произошло:")
+    text_lines.append(meta["story"])
+
+    text_lines.append("")
+    text_lines.append("Ключевые данные:")
+    for k, v in meta["fields"]:
+        text_lines.append(f"{k}: {v}")
+
+    if event_url:
+        text_lines.append("")
+        text_lines.append(f"Ссылка на событие: {event_url}")
+
+    if include_raw and meta["full_log"]:
+        text_lines.append("")
+        text_lines.append("Raw log:")
+        text_lines.append(meta["full_log"])
+
+    text_body = "\n".join(text_lines)
+
+    rows = []
+    for k, v in meta["fields"]:
+        rows.append(f"""
+        <tr>
+          <td width="220" valign="top" style="width:220px;padding:8px 10px;border:1px solid #d9e2f0;background-color:#f3f6fb;font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:bold;line-height:18px;color:#1f2937;mso-line-height-rule:exactly;">
+            {escape(str(k))}
+          </td>
+          <td valign="top" style="padding:8px 10px;border:1px solid #d9e2f0;font-family:Consolas,'Courier New',monospace;font-size:12px;line-height:18px;color:#111827;word-break:break-all;mso-line-height-rule:exactly;">
+            {escape(str(v))}
+          </td>
+        </tr>
+        """)
+
+    button_html = ""
+    if event_url:
+        button_html = f"""
+        <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin-top:16px;border-collapse:collapse;">
+          <tr>
+            <td bgcolor="{meta['sev_color']}" style="padding:10px 16px;background-color:{meta['sev_color']};">
+              <a href="{escape(event_url)}"
+                 style="font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;line-height:16px;color:#ffffff;text-decoration:none;display:inline-block;">
+                 Open event
+              </a>
+            </td>
+          </tr>
+        </table>
+        """
+
+    raw_html = ""
+    if include_raw and meta["full_log"]:
+        raw_html = f"""
+        <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:16px;border-collapse:collapse;table-layout:fixed;">
+          <tr>
+            <td style="padding:10px 12px;background-color:#0f172a;border:1px solid #d9e2f0;font-family:Consolas,'Courier New',monospace;font-size:12px;line-height:18px;color:#e2e8f0;white-space:pre-wrap;word-break:break-all;mso-line-height-rule:exactly;">
+              {escape(meta['full_log'])}
+            </td>
+          </tr>
+        </table>
+        """
+
+    html_body = f"""\
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="x-apple-disable-message-reformatting">
+  </head>
+  <body style="margin:0;padding:0;background-color:#f1f5f9;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background-color:#f1f5f9;">
+      <tr>
+        <td align="center" style="padding:24px 12px;">
+
+          <table role="presentation" width="820" border="0" cellpadding="0" cellspacing="0" style="width:820px;border-collapse:collapse;background-color:#ffffff;border:1px solid #d9e2f0;">
+            <tr>
+              <td bgcolor="{meta['sev_color']}" style="padding:18px 20px;background-color:{meta['sev_color']};font-family:Arial,Helvetica,sans-serif;color:#ffffff;">
+                <div style="font-size:12px;line-height:16px;mso-line-height-rule:exactly;">Wazuh alert notification</div>
+                <div style="font-size:22px;line-height:28px;font-weight:bold;padding-top:6px;mso-line-height-rule:exactly;">
+                  {escape(meta['title'])}
+                </div>
+                <div style="font-size:13px;line-height:18px;padding-top:8px;mso-line-height-rule:exactly;">
+                  Host: {escape(meta['host'])} | Severity: {escape(meta['sev_name'])} | Level: {escape(meta['level'])}
+                </div>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:20px;">
+
+                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:18px;table-layout:fixed;">
+                  <tr>
+                    <td style="padding:12px 14px;border-left:4px solid {meta['sev_color']};background-color:#eef6ff;font-family:Arial,Helvetica,sans-serif;">
+                      <div style="font-size:15px;line-height:20px;font-weight:bold;color:#111827;margin-bottom:6px;mso-line-height-rule:exactly;">
+                        Что произошло
+                      </div>
+                      <div style="font-size:14px;line-height:20px;color:#334155;mso-line-height-rule:exactly;word-break:break-word;">
+                        {escape(meta['story'])}
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+
+                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  <tr>
+                    <td style="padding:0 0 10px 0;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:20px;font-weight:bold;color:#111827;mso-line-height-rule:exactly;">
+                      Ключевые данные
+                    </td>
+                  </tr>
+                </table>
+
+                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;table-layout:fixed;">
+                  {''.join(rows)}
+                </table>
+
+                {button_html}
+                {raw_html}
+
+              </td>
+            </tr>
+          </table>
+
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+"""
+
+    return subject, text_body, html_body
+
+
+def send_email(cfg, subject, text_body, html_body):
+    smtp_host = cfg["smtp_host"]
+    smtp_port = int(cfg.get("smtp_port", 25))
+    sender = cfg["from"]
+    from_name = cfg.get("from_name", "")
+    timeout = int(cfg.get("smtp_timeout", 20))
+    recipients = as_list(cfg.get("to"))
+
+    if not recipients:
+        raise RuntimeError("No recipients configured")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = str(Header(subject, "utf-8"))
+    msg["From"] = f"{from_name} <{sender}>" if from_name else sender
+    msg["To"] = ", ".join(recipients)
+
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout) as server:
+        server.ehlo()
+        server.sendmail(sender, recipients, msg.as_string())
+
+
+HEALTH_STATE_PATH = '/var/ossec/var/run/custom_pretty_email_health.json'
+HEALTH_TTLS = {'204': 6 * 3600, '241': 24 * 3600}
+
+
+def process_health(cfg, alert=None, state_path=HEALTH_STATE_PATH):
+    """First alert immediately; timed summaries of repeats, separately per agent/rule.
+
+    Separate lock inode allows atomic state replacement. SMTP failures preserve
+    pending summaries and do not mark a failed first notification as delivered.
+    """
+    import os
+    import copy
+    import tempfile
+    now = time.time()
+    with open(state_path + '.lock', 'a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(state_path, encoding='utf-8') as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            state = {}
+        def save():
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state_path), prefix='.health-')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(state, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, state_path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        def deliver(a):
+            send_email(cfg, *build_messages(get_alert_meta(a), cfg))
+        def flush_one(key):
+            item = state[key]
+            if now < item['due']:
+                return
+            if item['repeats']:
+                summary = copy.deepcopy(item['alert'])
+                summary['rule']['description'] = (
+                    'Сводка повторов: ' + item['description'] +
+                    ' — повторных событий: ' + str(item['repeats']) +
+                    '; первое: ' + item['first'] + '; последнее: ' + item['last'] +
+                    '. Первое уведомление отправлено отдельно. Восстановление не подтверждено.'
+                )
+                deliver(summary)
+                item['repeats'] = 0
+                item['due'] = now + HEALTH_TTLS[item['rule']]
+            else:
+                del state[key]
+            save()
+        if alert is None:
+            errors = []
+            for key in list(state):
+                try:
+                    flush_one(key)
+                except Exception as e:
+                    errors.append(str(e))
+            if errors:
+                raise RuntimeError('Health summaries pending retry: ' + '; '.join(errors))
+            return
+        rid = str(alert['rule']['id'])
+        agent = alert.get('agent', {})
+        identity = str(agent.get('id') or agent.get('name') or '')
+        if not identity:
+            deliver(alert)
+            return
+        key = rid + ':' + identity
+        if key in state:
+            # Persist the new event before trying any overdue summary.
+            item = state[key]
+            item['repeats'] += 1
+            item['last'] = str(alert.get('timestamp', ''))
+            item['alert'] = alert
+            save()
+            flush_one(key)
+            return
+        deliver(alert)
+        state[key] = {'rule': rid, 'due': now + HEALTH_TTLS[rid],
+                      'repeats': 0, 'first': str(alert.get('timestamp', '')),
+                      'last': str(alert.get('timestamp', '')),
+                      'description': alert['rule']['description'], 'alert': alert}
+        save()
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise RuntimeError("Usage: custom-pretty-email <alert_json_path>")
+
+    if sys.argv[1] == "--flush-health":
+        process_health(load_json(CONFIG_PATH))
+        return
+
+    alert_path = sys.argv[1]
+    cfg = load_json(CONFIG_PATH)
+    alert = load_json(alert_path)
+
+    # ── ПРОВЕРКА ИСКЛЮЧЕНИЙ ──────────────────────
+    matched_exclusion = check_exclusions(alert)
+    if matched_exclusion:
+        sys.stderr.write(
+            f"custom-pretty-email: alert suppressed by exclusion "
+            f"'{matched_exclusion}'\n"
+        )
+        sys.exit(0)
+    # ─────────────────────────────────────────────
+
+    if str(alert.get("rule", {}).get("id", "")) in HEALTH_TTLS:
+        process_health(cfg, alert)
+        return
+
+    dedup_key, is_duplicate = reserve_dedup(alert)
+    if is_duplicate:
+        sys.stderr.write(
+            "custom-pretty-email: duplicate incident suppressed "
+            f"for rule '{alert.get('rule', {}).get('id', '-')}'\n"
+        )
+        sys.exit(0)
+
+    meta = get_alert_meta(alert)
+    subject, text_body, html_body = build_messages(meta, cfg)
+    try:
+        send_email(cfg, subject, text_body, html_body)
+    except Exception:
+        release_dedup(dedup_key)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        sys.stderr.write(f"custom-pretty-email failed: {e}\n")
+        sys.exit(1)

@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-09-11T12:00:00+00:00",
+  "id": "example-alert-001",
+  "rule": {
+    "id": "100001",
+    "level": 12,
+    "description": "Демонстрационный инцидент",
+    "groups": [
+      "example"
+    ]
+  },
+  "agent": {
+    "id": "001",
+    "name": "test-host-01",
+    "ip": "192.0.2.10"
+  },
+  "data": {
+    "srcip": "192.0.2.20",
+    "dstip": "192.0.2.10"
+  },
+  "full_log": "Synthetic example; no production data."
+}
